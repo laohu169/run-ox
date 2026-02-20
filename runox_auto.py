@@ -1,14 +1,20 @@
 """
 runox.io 自动续期 + 开机脚本
-参考 LunesHost 成功案例重写，使用相同的 SB 启动参数和 CF 验证方式
 
-运行方式:
-    xvfb-run -a python runox_auto.py
+流程:
+  1. 打开首页 https://runox.io/en/
+  2. 点击 Cookie 弹窗 "Accept all"
+  3. 点击顶部 Log In
+  4. 输入账号密码
+  5. 过 Cloudflare 验证
+  6. 点击登录按钮
+  7. 点击 Manage
+  8. 点击 Start / Restore 续期（没有则跳过）
+  9. 点击 Start 开机
 
-Secrets 配置:
-    RUNOX_ACCOUNTS = email:password  （多账号用逗号分隔：a@x.com:pwd1,b@x.com:pwd2）
-    TG_TOKEN       = Telegram Bot Token（可选，用于推送结果）
-    TG_CHAT_ID     = Telegram Chat ID（可选）
+Secrets:
+  RUNOX_ACCOUNTS = email:password（多账号逗号分隔）
+  TG_TOKEN / TG_CHAT_ID（可选，Telegram 推送）
 """
 
 import time
@@ -16,25 +22,21 @@ import os
 import random
 import requests
 
-# ── 智能环境配置（与参考代码一致）────────────────────────────
 if "DISPLAY" not in os.environ:
     os.environ["DISPLAY"] = ":1"
 if "XAUTHORITY" not in os.environ:
     if os.path.exists("/home/headless/.Xauthority"):
         os.environ["XAUTHORITY"] = "/home/headless/.Xauthority"
 
-print(f"[DEBUG] Env DISPLAY:    {os.environ.get('DISPLAY')}")
-print(f"[DEBUG] Env XAUTHORITY: {os.environ.get('XAUTHORITY')}")
+print(f"[DEBUG] DISPLAY:    {os.environ.get('DISPLAY')}")
+print(f"[DEBUG] XAUTHORITY: {os.environ.get('XAUTHORITY')}")
 
 from seleniumbase import SB
 
-# ================= 配置区域 =================
 PROXY_URL  = os.getenv("PROXY", "")
 TG_TOKEN   = os.getenv("TG_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-# ===========================================
-
-LOGIN_URL = "https://runox.io/en/login"   # 直接打开登录页，跳过首页跳转
+HOME_URL   = "https://runox.io/en/"
 
 
 class RunoxRenewal:
@@ -44,23 +46,30 @@ class RunoxRenewal:
             raise ValueError(f"账号格式错误，应为 email:password，收到: {acc}")
         self.email    = parts[0]
         self.password = parts[1]
-
-        self.BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
-        self.screenshot_dir = os.path.join(self.BASE_DIR, "artifacts")
+        self.screenshot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts")
         os.makedirs(self.screenshot_dir, exist_ok=True)
 
     def log(self, msg):
-        ts = time.strftime('%H:%M:%S')
-        print(f"[{ts}] {msg}", flush=True)
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-    def human_wait(self, min_s=6, max_s=10):
-        time.sleep(random.uniform(min_s, max_s))
+    def hw(self, a=4, b=8):
+        time.sleep(random.uniform(a, b))
 
     def shot(self, sb, name):
-        path = f"{self.screenshot_dir}/{name}"
-        sb.save_screenshot(path)
-        self.log(f"📸 截图: {name}")
-        return path
+        p = f"{self.screenshot_dir}/{name}"
+        sb.save_screenshot(p)
+        self.log(f"📸 {name}")
+        return p
+
+    def try_click(self, sb, selectors, timeout=6):
+        for sel in selectors:
+            try:
+                sb.wait_for_element_visible(sel, timeout=timeout)
+                sb.click(sel)
+                return True
+            except Exception:
+                continue
+        return False
 
     def send_tg(self, message, photo_path=None):
         if not TG_TOKEN or not TG_CHAT_ID:
@@ -74,13 +83,13 @@ class RunoxRenewal:
             else:
                 url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
                 requests.post(url, data={'chat_id': TG_CHAT_ID, 'text': message}, timeout=15)
-            self.log("✅ TG 推送已发送")
+            self.log("✅ TG 推送成功")
         except Exception as e:
             self.log(f"⚠️ TG 推送失败: {e}")
 
     def run(self):
         self.log("=" * 50)
-        self.log(f"🚀 开始处理账号: {self.email}")
+        self.log(f"🚀 开始处理: {self.email}")
         self.log("=" * 50)
 
         with SB(
@@ -95,111 +104,151 @@ class RunoxRenewal:
             try:
                 self.log("✅ 浏览器已启动")
 
-                # ── 1. 直接打开登录页（uc_open_with_reconnect 防 CF 拦截）──
-                self.log(f"📂 打开登录页: {LOGIN_URL}")
+                # ── 1. 打开首页 ───────────────────────────────────────────
+                self.log(f"📂 打开首页: {HOME_URL}")
                 sb.delete_all_cookies()
-                sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=5)
-                self.shot(sb, "01_loginpage.png")
+                sb.uc_open_with_reconnect(HOME_URL, reconnect_time=5)
+                self.hw(3, 5)
+                self.shot(sb, "01_homepage.png")
 
-                # ── 2. 等待并填写账号密码 ─────────────────────────────────
-                self.log("✏️ 填写账号密码...")
-                sb.wait_for_element_visible("#email", timeout=25)
-                sb.type("#email", self.email)
-                sb.type("#password", self.password)
-                self.shot(sb, "02_after_input.png")
+                # ── 2. 点击 Cookie 弹窗 "Accept all" ─────────────────────
+                self.log("🍪 处理 Cookie 弹窗...")
+                cookie_clicked = self.try_click(sb, [
+                    "//button[contains(text(),'Accept all')]",
+                    "//button[contains(text(),'Accept All')]",
+                    "//button[contains(text(),'accept')]",
+                    "button.accept-all",
+                    "[data-testid='accept-all']",
+                ], timeout=8)
+                if cookie_clicked:
+                    self.log("✅ Cookie 弹窗已接受")
+                else:
+                    self.log("⚠️ 未找到 Cookie 弹窗（可能已接受过），继续...")
+                self.hw(2, 3)
+                self.shot(sb, "02_after_cookie.png")
 
-                # ── 3. 过 Cloudflare 验证 ─────────────────────────────────
+                # ── 3. 点击顶部 Log In ────────────────────────────────────
+                self.log("🖱️ 点击 Log In...")
+                login_clicked = self.try_click(sb, [
+                    "//a[normalize-space()='Log In']",
+                    "//button[normalize-space()='Log In']",
+                    "a[href*='login']",
+                    "//a[contains(text(),'Log In')]",
+                    "//a[contains(text(),'Login')]",
+                ], timeout=10)
+                if not login_clicked:
+                    self.shot(sb, "error_no_login_btn.png")
+                    raise Exception("未找到 Log In 按钮")
+                self.log("✅ Log In 已点击")
+                self.hw(3, 5)
+                self.shot(sb, "03_loginpage.png")
+                self.log(f"📍 当前URL: {sb.get_current_url()}")
+
+                # ── 4. 填写账号密码 ───────────────────────────────────────
+                self.log("✏️ 等待登录表单...")
+                email_sel = None
+                for sel in ["#email", "input[name='email']", "input[type='email']",
+                            "input[placeholder*='mail']", "input[type='text']"]:
+                    try:
+                        sb.wait_for_element_visible(sel, timeout=8)
+                        email_sel = sel
+                        self.log(f"✅ 邮箱框: {sel}")
+                        break
+                    except Exception:
+                        continue
+
+                if not email_sel:
+                    self.shot(sb, "error_no_form.png")
+                    raise Exception("未找到登录表单，查看截图确认页面状态")
+
+                sb.type(email_sel, self.email)
+
+                for sel in ["#password", "input[name='password']", "input[type='password']"]:
+                    try:
+                        sb.wait_for_element_visible(sel, timeout=8)
+                        sb.type(sel, self.password)
+                        self.log(f"✅ 密码框: {sel}")
+                        break
+                    except Exception:
+                        continue
+
+                self.shot(sb, "04_after_input.png")
+
+                # ── 5. 过 Cloudflare 验证 ─────────────────────────────────
                 self.log("🔄 处理 Cloudflare 验证...")
-                sb.uc_gui_click_captcha()
-                self.human_wait(6, 10)
-                sb.uc_gui_handle_captcha()
-                self.human_wait(6, 10)
-                self.shot(sb, "03_after_captcha.png")
+                try:
+                    sb.uc_gui_click_captcha()
+                    self.hw(6, 10)
+                    sb.uc_gui_handle_captcha()
+                    self.hw(6, 10)
+                    self.log("✅ CF 验证完成")
+                except Exception as e:
+                    self.log(f"⚠️ CF 验证跳过: {e}")
+                self.shot(sb, "05_after_captcha.png")
 
-                # ── 4. 点击登录按钮 ───────────────────────────────────────
+                # ── 6. 点击登录按钮 ───────────────────────────────────────
                 self.log("🖱️ 点击登录按钮...")
-                sb.click('button.submit-btn')
+                login_submit = self.try_click(sb, [
+                    "button.submit-btn",
+                    "button[type='submit']",
+                    "//button[contains(text(),'Log In')]",
+                    "//button[contains(text(),'Login')]",
+                    "//button[contains(text(),'Sign In')]",
+                ], timeout=10)
+                if not login_submit:
+                    self.shot(sb, "error_no_submit.png")
+                    raise Exception("未找到登录提交按钮")
+
                 self.log("⏳ 等待登录跳转（30s）...")
                 time.sleep(30)
-                self.shot(sb, "04_after_login.png")
-                self.log(f"📍 当前页面: {sb.get_current_url()}")
+                self.shot(sb, "06_after_login.png")
+                self.log(f"📍 当前URL: {sb.get_current_url()}")
 
-                # ── 5. 点击 Manage 按钮 ───────────────────────────────────
+                # ── 7. 点击 Manage ────────────────────────────────────────
                 self.log("🔍 寻找 Manage 按钮...")
-                manage_selectors = [
+                manage_ok = self.try_click(sb, [
                     "//button[contains(text(),'Manage')]",
                     "//a[contains(text(),'Manage')]",
                     "a[href*='manage']",
                     ".manage-btn",
-                ]
-                manage_ok = False
-                for sel in manage_selectors:
-                    try:
-                        sb.wait_for_element_visible(sel, timeout=10)
-                        sb.click(sel)
-                        manage_ok = True
-                        self.log(f"✅ Manage 点击成功 ({sel})")
-                        break
-                    except Exception:
-                        continue
-
+                ], timeout=15)
                 if not manage_ok:
                     self.shot(sb, "error_no_manage.png")
-                    raise Exception("未找到 Manage 按钮，登录可能未成功")
+                    raise Exception("未找到 Manage 按钮，登录可能失败")
+                self.log("✅ Manage 点击成功")
+                self.hw(3, 5)
+                self.shot(sb, "07_after_manage.png")
 
-                time.sleep(5)
-                self.shot(sb, "05_after_manage.png")
-
-                # ── 6. 点击 Start / Restore 续期 ─────────────────────────
+                # ── 8. 点击 Start / Restore 续期 ─────────────────────────
                 self.log("🔍 寻找 Start / Restore 按钮...")
-                restore_selectors = [
+                restore_ok = self.try_click(sb, [
                     "//button[contains(text(),'Start / Restore')]",
                     "//button[contains(text(),'Restore')]",
                     "//a[contains(text(),'Start / Restore')]",
                     "//a[contains(text(),'Restore')]",
-                ]
-                restore_ok = False
-                for sel in restore_selectors:
-                    try:
-                        sb.wait_for_element_visible(sel, timeout=8)
-                        sb.click(sel)
-                        restore_ok = True
-                        self.log("✅ Start / Restore 点击成功 —— 续期完成！")
-                        break
-                    except Exception:
-                        continue
+                ], timeout=8)
+                if restore_ok:
+                    self.log("✅ 续期完成！")
+                else:
+                    self.log("⏰ 无 Start/Restore 按钮 —— 未到续期时间")
+                    self.shot(sb, "08_no_restore.png")
+                self.hw(3, 5)
 
-                if not restore_ok:
-                    self.log("⏰ 无 Start/Restore 按钮 —— 未到续期时间，跳过")
-                    self.shot(sb, "06_no_restore.png")
-
-                time.sleep(5)
-
-                # ── 7. 点击 Start 开机 ────────────────────────────────────
+                # ── 9. 点击 Start 开机 ────────────────────────────────────
                 self.log("🔍 寻找 Start 按钮（开机）...")
-                start_selectors = [
+                start_ok = self.try_click(sb, [
                     "//button[normalize-space()='Start']",
                     "//a[normalize-space()='Start']",
                     "//button[contains(text(),'Start') and not(contains(text(),'Restore'))]",
-                ]
-                start_ok = False
-                for sel in start_selectors:
-                    try:
-                        sb.wait_for_element_visible(sel, timeout=8)
-                        sb.click(sel)
-                        start_ok = True
-                        self.log("✅ Start 点击成功 —— 开机指令已发送！")
-                        break
-                    except Exception:
-                        continue
-
-                if not start_ok:
+                ], timeout=8)
+                if start_ok:
+                    self.log("✅ 开机指令已发送！")
+                else:
                     self.log("⚠️ 未找到 Start 按钮（可能已在运行中）")
 
                 time.sleep(3)
-                final = self.shot(sb, "07_final.png")
-
-                msg = f"✅ {self.email} 保活流程完成"
+                final = self.shot(sb, "09_final.png")
+                msg = f"✅ {self.email} 保活完成"
                 self.log(msg)
                 self.send_tg(msg, final)
 
@@ -215,13 +264,12 @@ class RunoxRenewal:
 if __name__ == "__main__":
     accounts = os.getenv("RUNOX_ACCOUNTS", "")
     if not accounts:
-        print("❌ Error: 请设置环境变量 RUNOX_ACCOUNTS（格式: email:password）")
+        print("❌ 请设置 RUNOX_ACCOUNTS 环境变量（格式: email:password）")
         exit(1)
-
     for acc in accounts.split(','):
         acc = acc.strip()
         if acc:
             try:
                 RunoxRenewal(acc).run()
             except Exception:
-                print(f"⚠️ 账号 {acc.split(':')[0]} 处理失败，继续下一个...")
+                print(f"⚠️ {acc.split(':')[0]} 处理失败，继续下一个...")
